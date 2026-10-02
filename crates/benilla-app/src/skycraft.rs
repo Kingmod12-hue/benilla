@@ -46,6 +46,18 @@ fn yards_per_block() -> f32 {
     })
 }
 
+/// The overlay's size against the window: `SKYCRAFT_OVERLAY_SCALE`, 0.5 by default.
+fn overlay_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("SKYCRAFT_OVERLAY_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (0.25..=1.0).contains(v))
+            .unwrap_or(0.5)
+    })
+}
+
 // ---- protocol (SkyCraft v10/v11 share these layouts) ------------------------------------------
 const MAGIC: u32 = 0x4359_4B53;
 const OFF_SKY_STATE: usize = 0x100;
@@ -107,7 +119,7 @@ const REGION: i32 = 8;
 const RADIUS_XZ: i32 = 4;
 const RADIUS_Y: i32 = 2;
 /// Regions harvested per frame.
-const REGIONS_PER_FRAME: usize = 3;
+const REGIONS_PER_FRAME: usize = 2;
 /// How far above a region the terrain is looked for, so buried regions fill solid (blocks).
 const TERRAIN_LOOKUP_ABOVE: f32 = 96.0;
 /// A sent region is re-sent this long after the world's colliders changed (seconds).
@@ -700,6 +712,10 @@ fn host_frame(
         .single()
         .map(|w| (w.physical_width(), w.physical_height()))
         .unwrap_or((1280, 720));
+    // Minecraft draws its HUD at this size; we stretch it over the window. Its GUI scale follows
+    // the size, so half size looks the same with a quarter of the pixels to copy each frame.
+    let k = overlay_scale();
+    let (vw, vh) = (((vw as f32 * k) as u32).max(320), ((vh as f32 * k) as u32).max(240));
 
     let mut flags = 0;
     if player.active {
@@ -1262,7 +1278,7 @@ fn show_overlay(
     }
     let size = UVec2::new(w, h);
     if host.overlay.as_ref().map(|(_, s)| *s) != Some(size) {
-        let image = Image::new_fill(
+        let mut image = Image::new_fill(
             Extent3d {
                 width: w,
                 height: h,
@@ -1273,6 +1289,8 @@ fn show_overlay(
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
+        // Pixel art: stretched without blur.
+        image.sampler = bevy::image::ImageSampler::nearest();
         let handle = images.add(image);
         if nodes.is_empty() {
             commands.spawn((
@@ -1302,7 +1320,7 @@ fn show_overlay(
     let Some((handle, _)) = host.overlay.as_ref() else {
         return;
     };
-    let Some(mut image) = images.get_mut(handle) else {
+    let Some(image) = images.get_mut(handle) else {
         return;
     };
     let Some(data) = image.data.as_mut() else {
