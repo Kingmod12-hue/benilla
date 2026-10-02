@@ -342,6 +342,7 @@ struct SkyHost {
     typing_was: bool,
     last_log: f32,
     in_world_logged: bool,
+    last_flags: u32,
 }
 
 pub(crate) struct SkyCraftPlugin;
@@ -503,6 +504,15 @@ fn host_frame(
     let feet = from_mc(f64_at(&mc, 0x08), f64_at(&mc, 0x10), f64_at(&mc, 0x18));
     let eye = from_mc(f64_at(&mc, 0x50), f64_at(&mc, 0x58), f64_at(&mc, 0x60));
     let in_world = mc_flags & MC_IN_WORLD != 0;
+    if mc_flags != host.last_flags {
+        info!(
+            "skycraft: mc flags {:#x} -> {mc_flags:#x} (sneaking {}, sprinting {})",
+            host.last_flags,
+            mc_flags & (1 << 3) != 0,
+            mc_flags & (1 << 4) != 0
+        );
+        host.last_flags = mc_flags;
+    }
     let now = time.elapsed_secs();
     if now - host.last_log > 5.0 {
         host.last_log = now;
@@ -549,6 +559,9 @@ fn forward_keys(
             continue;
         }
         let was = down.contains(&code);
+        if code >= 224 && pressed != was {
+            info!("skycraft: key {code} {}", if pressed { "down" } else { "up" });
+        }
         if pressed && !was {
             down.push(code);
             link.push_input(IN_KEY, code, 1, 0, 0);
