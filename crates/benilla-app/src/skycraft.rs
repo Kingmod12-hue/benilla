@@ -69,6 +69,16 @@ const RING_HEAD: usize = 0x00;
 const RING_TAIL: usize = 0x40;
 const RING_DATA: usize = 0x80;
 const INPUT_RING_ENTRIES: u64 = 4096;
+const EVENT_RING_ENTRIES: u64 = 512;
+const MAX_ACTORS: usize = 256;
+const ACTOR_HOSTILE: u32 = 1;
+const ACTOR_DEAD: u32 = 1 << 1;
+const ACTOR_IN_COMBAT: u32 = 1 << 3;
+const EV_HIT_ACTOR: u32 = 1;
+const EV_PLAYER_DIED: u32 = 2;
+const IN_HURT: u16 = 7;
+/// Stand-ins exist this far out (blocks), as SkyCraft's.
+const ACTOR_RANGE_BLOCKS: f32 = 80.0;
 const COL_DATA_BYTES: u64 = (COLLISION_RING_BYTES - RING_DATA) as u64;
 
 const SKY_IN_GAME: u32 = 1;
@@ -337,10 +347,46 @@ impl Mapping {
         true
     }
 
-    /// Stage 1 draws nothing of Minecraft's: consume its event and render rings so it never stalls.
+    /// Nothing of Minecraft's world is drawn yet: consume its render ring so it never stalls.
+    /// One Minecraft event (32 bytes), oldest first.
+    fn pop_event(&self) -> Option<[u8; 32]> {
+        use std::sync::atomic::Ordering;
+        let head = self.atomic_u64(OFF_EVENT_RING + RING_HEAD).load(Ordering::Acquire);
+        let tail_a = self.atomic_u64(OFF_EVENT_RING + RING_TAIL);
+        let mut tail = tail_a.load(Ordering::Relaxed);
+        if tail >= head {
+            return None;
+        }
+        if head - tail > EVENT_RING_ENTRIES {
+            tail = head - EVENT_RING_ENTRIES;
+        }
+        let mut e = [0u8; 32];
+        self.read_bytes(
+            OFF_EVENT_RING + RING_DATA + ((tail & (EVENT_RING_ENTRIES - 1)) as usize) * 32,
+            &mut e,
+        );
+        tail_a.store(tail + 1, Ordering::Release);
+        Some(e)
+    }
+
+    /// The actor table (seqlock): WoW's units as Minecraft's hittable stand-ins.
+    fn write_actors(&self, records: &[[u8; 64]]) {
+        use std::sync::atomic::Ordering;
+        let seq = self.atomic_u32(OFF_ACTOR_TABLE);
+        let s = seq.load(Ordering::Relaxed) & !1;
+        seq.store(s + 1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let n = records.len().min(MAX_ACTORS);
+        self.write_u32(OFF_ACTOR_TABLE + 4, n as u32);
+        for (i, r) in records.iter().take(n).enumerate() {
+            self.write_bytes(OFF_ACTOR_TABLE + 0x40 + i * 64, r);
+        }
+        seq.store(s + 2, Ordering::Release);
+    }
+
     fn drain_guest_rings(&self) {
         use std::sync::atomic::Ordering;
-        for off in [OFF_EVENT_RING, OFF_RENDER_RING] {
+        for off in [OFF_RENDER_RING] {
             let head = self.atomic_u64(off + RING_HEAD).load(Ordering::Acquire);
             self.atomic_u64(off + RING_TAIL).store(head, Ordering::Release);
         }
@@ -407,6 +453,10 @@ struct SkyHost {
     /// The overlay triple buffer's front slot (ours), 2 after a reset.
     overlay_front: u32,
     overlay: Option<(Handle<Image>, UVec2)>,
+    /// This frame's stand-ins: form id (the GUID's low half) to the unit.
+    actors: HashMap<u32, (Entity, u64, u32, u32)>,
+    /// Our own health last frame, for mirroring WoW's hits onto Minecraft's hearts.
+    last_health: Option<u32>,
 }
 
 pub(crate) struct SkyCraftPlugin;
@@ -428,6 +478,7 @@ impl Plugin for SkyCraftPlugin {
                     .in_set(InWorldGated),
             )
             .add_systems(Update, show_overlay.after(host_frame))
+            .add_systems(Update, combat.after(host_frame).in_set(InWorldGated))
             .add_systems(
             Update,
             (host_frame, stream_collision)
@@ -876,6 +927,180 @@ fn claim_input(
                 }
             }
         }
+    }
+}
+
+// ---- combat ------------------------------------------------------------------------------------
+
+/// Minecraft's weapons against WoW's units, and WoW's hits on Minecraft's hearts.
+///
+/// Nearby units go to Minecraft as invisible hittable stand-ins (the actor table). A hit Minecraft
+/// reports lands on the server as the GM `.damage` command on that unit (the account is GM; the
+/// server's own damage path gives the kill credit, loot and XP). Damage we take in WoW is passed to
+/// Minecraft as a fraction of our health against its 20.
+#[allow(clippy::too_many_arguments)]
+fn combat(
+    mut host: ResMut<SkyHost>,
+    units: Query<
+        (
+            Entity,
+            &crate::net::NetEntity,
+            &crate::net::Guid,
+            &GlobalTransform,
+            Option<&crate::net::ObjectStore>,
+            Option<&crate::entities::CollisionHeight>,
+        ),
+        Without<crate::net::SelfPlayer>,
+    >,
+    me: Query<(&crate::net::ObjectStore, &crate::net::Guid), With<crate::net::SelfPlayer>>,
+    reactions: crate::target::ReactionInputs,
+    names: Res<crate::names::NameCache>,
+    net: Res<crate::net::NetCommands>,
+    mut selection: ResMut<crate::target::Selection>,
+    player: Res<Player>,
+) {
+    let Some(link) = host.link else {
+        return;
+    };
+    if !host.driving {
+        while link.pop_event().is_some() {}
+        if !host.actors.is_empty() {
+            host.actors.clear();
+            link.write_actors(&[]);
+        }
+        host.last_health = None;
+        return;
+    }
+    let me = me.single().ok();
+    let self_store = me.map(|(s, _)| s);
+    let self_guid = me.map(|(_, g)| g.0);
+    let factions = reactions.factions.as_deref();
+    let ypb = yards_per_block();
+
+    // ---- the stand-ins ----
+    let mut records: Vec<[u8; 64]> = Vec::new();
+    let mut actors = HashMap::new();
+    let mut attacker = 0u32;
+    let mut attacker_d = f32::MAX;
+    for (entity, ne, guid, tf, store, height) in &units {
+        if !matches!(ne.kind, benilla_protocol::EntityKind::Unit) {
+            continue;
+        }
+        let pos = tf.translation();
+        let d = pos.distance(player.pos);
+        if d > ACTOR_RANGE_BLOCKS * ypb || records.len() >= MAX_ACTORS {
+            continue;
+        }
+        let Some(store) = store else {
+            continue;
+        };
+        let f = &store.0;
+        let form = (guid.0 & 0xFFFF_FFFF) as u32;
+        let mut flags = 0;
+        if crate::target::can_attack(Some(store), factions, &reactions.reputations, self_store) {
+            flags |= ACTOR_HOSTILE;
+        }
+        if f.unit_reads_dead() {
+            flags |= ACTOR_DEAD;
+        }
+        if f.unit_flags() & (1 << 19) != 0 {
+            flags |= ACTOR_IN_COMBAT;
+        }
+        if flags & ACTOR_DEAD == 0 && f.unit_target().is_some() && f.unit_target() == self_guid
+            && flags & ACTOR_IN_COMBAT != 0 && d < attacker_d
+        {
+            attacker = form;
+            attacker_d = d;
+        }
+        let level = f.unit_level().unwrap_or(1);
+        let mc = to_mc(pos);
+        let fwd = tf.rotation() * Vec3::NEG_Z;
+        let yaw = (-fwd.x).atan2(fwd.z).to_degrees();
+        let scale = ne.scale.max(0.1);
+        let radius = f.unit_bounding_radius().max(0.4) * scale;
+        let width = (radius * 2.0 / ypb).clamp(0.3, 6.0);
+        let tall = height.map(|h| h.0).filter(|h| *h > 0.1).unwrap_or(2.0 * scale);
+        let tall = (tall / ypb).clamp(0.3, 12.0);
+        let max = f.unit_max_health().unwrap_or(0);
+        let frac = if max > 0 {
+            (f.unit_health().unwrap_or(0) as f32 / max as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mut r = [0u8; 64];
+        r[0..4].copy_from_slice(&form.to_le_bytes());
+        r[4..8].copy_from_slice(&flags.to_le_bytes());
+        r[8..12].copy_from_slice(&(mc[0] as f32).to_le_bytes());
+        r[12..16].copy_from_slice(&(mc[1] as f32).to_le_bytes());
+        r[16..20].copy_from_slice(&(mc[2] as f32).to_le_bytes());
+        r[20..24].copy_from_slice(&yaw.to_le_bytes());
+        r[24..28].copy_from_slice(&width.to_le_bytes());
+        r[28..32].copy_from_slice(&tall.to_le_bytes());
+        r[32..36].copy_from_slice(&frac.to_le_bytes());
+        r[36..38].copy_from_slice(&(level.min(u16::MAX as u32) as u16).to_le_bytes());
+        if let Some(name) = names.peek_unit(guid.0, Some(store)) {
+            let mut end = name.len().min(23);
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            r[40..40 + end].copy_from_slice(&name.as_bytes()[..end]);
+        }
+        records.push(r);
+        actors.insert(form, (entity, guid.0, level, flags));
+    }
+    link.write_actors(&records);
+    host.actors = actors;
+
+    // ---- Minecraft's hits on them ----
+    while let Some(ev) = link.pop_event() {
+        let kind = u32_at(&ev, 0);
+        let form = u32_at(&ev, 4);
+        let mc_damage = f32::from_le_bytes(ev[8..12].try_into().unwrap());
+        match kind {
+            EV_HIT_ACTOR => {
+                let Some(&(entity, guid, level, flags)) = host.actors.get(&form) else {
+                    continue;
+                };
+                // Only what WoW lets us attack: no killing quest givers or guards of our faction.
+                if flags & ACTOR_HOSTILE == 0 || flags & ACTOR_DEAD != 0 {
+                    continue;
+                }
+                // Minecraft's damage (a diamond sword hits for 7) against WoW's health, which
+                // grows with level: a few hits for a mob of your own level, as in Minecraft.
+                let damage = (mc_damage * (2.0 + level as f32)).round().max(1.0) as u32;
+                if selection.guid != Some(guid) {
+                    selection.last = selection.guid;
+                    selection.target = Some(entity);
+                    selection.guid = Some(guid);
+                }
+                let _ = net.0.send(crate::net::ClientCommand::SetSelection { guid });
+                let _ = net.0.send(crate::net::ClientCommand::Chat {
+                    kind: crate::net::ChatKind::Say,
+                    target: None,
+                    text: format!(".damage {damage}"),
+                    language: None,
+                });
+                info!("skycraft: Minecraft hit {guid:#x} for {mc_damage:.1} -> .damage {damage}");
+            }
+            EV_PLAYER_DIED => info!("skycraft: the Minecraft player died"),
+            _ => {}
+        }
+    }
+
+    // ---- WoW's hits on us ----
+    if let Some(store) = self_store {
+        let hp = store.0.unit_health().unwrap_or(0);
+        let max = store.0.unit_max_health().unwrap_or(0);
+        if let Some(last) = host.last_health {
+            if hp < last && last > 0 && max > 0 {
+                let mc = (last - hp) as f32 / max as f32 * 20.0;
+                // SkyCraft's hurt input is in Skyrim damage x100; the mod divides by 5.
+                let kind = if attacker != 0 { 0 } else { 3 };
+                link.push_input(IN_HURT, kind, (mc * 5.0 * 100.0) as i32, attacker as i32, 0);
+                info!("skycraft: WoW hit us for {} -> {mc:.1} Minecraft", last - hp);
+            }
+        }
+        host.last_health = Some(hp);
     }
 }
 
