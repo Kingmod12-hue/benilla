@@ -11,8 +11,8 @@
 //! teleport, the avatar stands where Minecraft's player stands, and the movement keys are mirrored
 //! to Minecraft. The look stays benilla's: its camera yaw and pitch are Minecraft's.
 //!
-//! Enabled by `BENILLA_SKYCRAFT=1` (PLAY-SKYCRAFT.bat). Mapping: 1 block = 1 yard, MC axes = Bevy
-//! axes (both right-handed, Y up), so MC (x, y, z) = Bevy (x, y, z) / YARDS_PER_BLOCK.
+//! Enabled by `BENILLA_SKYCRAFT=1` (PLAY-SKYCRAFT.bat). Mapping: 1 block = `SKYCRAFT_SCALE` yards (1.3), MC axes = Bevy
+//! axes (both right-handed, Y up), so MC (x, y, z) = Bevy (x, y, z) / yards_per_block().
 
 use std::collections::HashMap;
 
@@ -30,8 +30,18 @@ use crate::net::{TeleportMessage, WorldportMessage};
 use crate::player::Player;
 use crate::ui_script::{UiInput, UiKeyboardCapture};
 
-/// Yards per Minecraft block.
-pub(crate) const YARDS_PER_BLOCK: f32 = 1.0;
+/// Yards per Minecraft block: `SKYCRAFT_SCALE`, 1.3 by default, which puts Minecraft's sprint
+/// (5.6 blocks/s) at WoW's run speed (7 yd/s) and its walk at about 5.6 yd/s.
+fn yards_per_block() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("SKYCRAFT_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (0.5..=3.0).contains(v))
+            .unwrap_or(1.3)
+    })
+}
 
 // ---- protocol (SkyCraft v10/v11 share these layouts) ------------------------------------------
 const MAGIC: u32 = 0x4359_4B53;
@@ -393,11 +403,11 @@ fn sdl_scancode(key: KeyCode) -> Option<u16> {
 }
 
 fn to_mc(v: Vec3) -> [f64; 3] {
-    let s = YARDS_PER_BLOCK as f64;
+    let s = yards_per_block() as f64;
     [v.x as f64 / s, v.y as f64 / s, v.z as f64 / s]
 }
 fn from_mc(x: f64, y: f64, z: f64) -> Vec3 {
-    Vec3::new(x as f32, y as f32, z as f32) * YARDS_PER_BLOCK
+    Vec3::new(x as f32, y as f32, z as f32) * yards_per_block()
 }
 
 fn f64_at(b: &[u8], off: usize) -> f64 {
@@ -596,7 +606,7 @@ fn forward_keys(
 // ---- collision export ----------------------------------------------------------------------------
 
 fn region_of(p: Vec3) -> IVec3 {
-    let b = p / YARDS_PER_BLOCK;
+    let b = p / yards_per_block();
     IVec3::new(
         (b.x.floor() as i32).div_euclid(REGION),
         (b.y.floor() as i32).div_euclid(REGION),
@@ -694,8 +704,8 @@ fn harvest(
     let min_b = (r * REGION).as_vec3();
     let max_b = min_b + Vec3::splat(size);
     // Look a long way up for the terrain over this region, to fill buried regions.
-    let lo = min_b * YARDS_PER_BLOCK;
-    let hi = Vec3::new(max_b.x, max_b.y + TERRAIN_LOOKUP_ABOVE, max_b.z) * YARDS_PER_BLOCK;
+    let lo = min_b * yards_per_block();
+    let hi = Vec3::new(max_b.x, max_b.y + TERRAIN_LOOKUP_ABOVE, max_b.z) * yards_per_block();
     let faces = world.faces_near_body((lo + hi) * 0.5, (hi - lo) * 0.5 + Vec3::splat(0.05), 200_000);
 
     // Sub-voxel grid of the region: 64 x 64 x 64 bits as [y][z] -> u64 (x).
@@ -710,7 +720,7 @@ fn harvest(
     let mut tri_bytes = Vec::new();
     let mut tri_count = 0u32;
     for f in &faces {
-        let v = f.world_verts().map(|p| p / YARDS_PER_BLOCK);
+        let v = f.world_verts().map(|p| p / yards_per_block());
         let is_terrain = terrain.contains(f.entity);
         let tmin = v[0].min(v[1]).min(v[2]);
         let tmax = v[0].max(v[1]).max(v[2]);
@@ -835,7 +845,7 @@ fn minecraft_camera(
         };
     }
     // Third person (the camera pulled back from the head) keeps benilla's own camera.
-    if t.translation.distance(mc.eye) > 1.5 {
+    if t.translation.distance(mc.eye) > 2.0 {
         return;
     }
     let g = -mc.bob_phase * std::f32::consts::PI;
