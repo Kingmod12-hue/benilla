@@ -1192,7 +1192,7 @@ fn show_things(
         let trident_m = mat(Color::srgb(0.35, 0.65, 0.6));
         let item_m = mat(Color::srgb(0.85, 0.85, 0.8));
         host.things = Some(ThingAssets {
-            arrow: (meshes.add(Cuboid::new(0.06 * ypb, 0.06 * ypb, 0.7 * ypb)), arrow_m),
+            arrow: (meshes.add(Cuboid::new(0.12 * ypb, 0.12 * ypb, 0.9 * ypb)), arrow_m),
             trident: (meshes.add(Cuboid::new(0.08 * ypb, 0.08 * ypb, 1.0 * ypb)), trident_m),
             item: (meshes.add(Cuboid::new(0.25 * ypb, 0.25 * ypb, 0.25 * ypb)), item_m),
         });
