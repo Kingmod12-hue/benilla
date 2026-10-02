@@ -359,7 +359,6 @@ impl Mapping {
         true
     }
 
-    /// Nothing of Minecraft's world is drawn yet: consume its render ring so it never stalls.
     /// One Minecraft event (32 bytes), oldest first.
     fn pop_event(&self) -> Option<[u8; 32]> {
         use std::sync::atomic::Ordering;
@@ -394,14 +393,6 @@ impl Mapping {
             self.write_bytes(OFF_ACTOR_TABLE + 0x40 + i * 64, r);
         }
         seq.store(s + 2, Ordering::Release);
-    }
-
-    fn drain_guest_rings(&self) {
-        use std::sync::atomic::Ordering;
-        for off in [OFF_RENDER_RING] {
-            let head = self.atomic_u64(off + RING_HEAD).load(Ordering::Acquire);
-            self.atomic_u64(off + RING_TAIL).store(head, Ordering::Release);
-        }
     }
 }
 
@@ -472,6 +463,11 @@ struct SkyHost {
     /// Minecraft's arrows and dropped items as drawn here: MC entity id to ours.
     shown: HashMap<u32, Entity>,
     things: Option<ThingAssets>,
+    /// Minecraft's blocks: its texture atlas as two materials (cut-out, translucent), and one
+    /// entity per 16-block section and pass.
+    block_mats: Option<(Handle<StandardMaterial>, Handle<StandardMaterial>)>,
+    sections: HashMap<IVec3, Vec<Entity>>,
+    ren_logged: u32,
 }
 
 /// Stand-in meshes for Minecraft's things (arrows, tridents, dropped items).
@@ -505,6 +501,7 @@ impl Plugin for SkyCraftPlugin {
             .add_systems(Update, show_overlay.after(host_frame))
             .add_systems(Update, combat.after(host_frame).in_set(InWorldGated))
             .add_systems(Update, show_things.after(host_frame))
+            .add_systems(Update, draw_blocks.after(host_frame))
             .add_systems(
             Update,
             (host_frame, stream_collision)
@@ -660,7 +657,6 @@ fn host_frame(
         return;
     };
     link.heartbeat();
-    link.drain_guest_rings();
 
     // A (re)started Minecraft starts over: fresh collision and a teleport to us.
     let pid = link.mc_pid();
@@ -1134,6 +1130,205 @@ fn combat(
         }
         host.last_health = Some(hp);
     }
+}
+
+// ---- Minecraft's blocks ---------------------------------------------------------------------------
+
+const REN_PAD: u32 = 0;
+const REN_ATLAS: u32 = 1;
+const REN_SECTION: u32 = 2;
+const REN_CLEAR_ALL: u32 = 3;
+/// How much of the render ring one frame may consume (the rest waits a frame).
+const REN_BUDGET: u64 = 24 << 20;
+
+#[derive(Component)]
+struct McSection;
+
+/// Minecraft's own block meshes (built by its block renderer: models, tint, ambient occlusion)
+/// and its block atlas, from SkyCraft's render ring, drawn where Minecraft has them: placed
+/// blocks, builds and water show up in WoW's world. The per-frame scene (mobs, the avatar) and
+/// the animated atlas frames are skipped for now.
+fn draw_blocks(
+    mut commands: Commands,
+    mut host: ResMut<SkyHost>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(link) = host.link else {
+        return;
+    };
+    let head = link.atomic_u64(OFF_RENDER_RING + RING_HEAD).load(Ordering::Acquire);
+    let tail_a = link.atomic_u64(OFF_RENDER_RING + RING_TAIL);
+    let mut tail = tail_a.load(Ordering::Relaxed);
+    let size = (RENDER_RING_BYTES - RING_DATA) as u64;
+    let data = OFF_RENDER_RING + RING_DATA;
+    let mut done = 0u64;
+    let mut hdr = [0u8; 8];
+    while tail < head && done < REN_BUDGET {
+        let pos = tail % size;
+        if size - pos < 8 {
+            tail += size - pos;
+            continue;
+        }
+        link.read_bytes(data + pos as usize, &mut hdr);
+        let kind = u32_at(&hdr, 0);
+        let bytes = u32_at(&hdr, 4) as u64;
+        if kind == REN_PAD {
+            tail += size - pos;
+            continue;
+        }
+        let msg = (8 + bytes + 7) & !7;
+        let at = data + pos as usize + 8;
+        match kind {
+            REN_ATLAS if bytes >= 8 => {
+                let mut wh = [0u8; 8];
+                link.read_bytes(at, &mut wh);
+                let (w, h) = (u32_at(&wh, 0), u32_at(&wh, 4));
+                if w > 0 && h > 0 && w <= 16384 && h <= 16384 && bytes >= 8 + w as u64 * h as u64 * 4 {
+                    let mut px = vec![0u8; (w * h * 4) as usize];
+                    link.read_bytes(at + 8, &mut px);
+                    let mut image = Image::new(
+                        Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        TextureDimension::D2,
+                        px,
+                        TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::RENDER_WORLD,
+                    );
+                    image.sampler = bevy::image::ImageSampler::nearest();
+                    let tex = images.add(image);
+                    let cut = materials.add(StandardMaterial {
+                        base_color_texture: Some(tex.clone()),
+                        alpha_mode: AlphaMode::Mask(0.5),
+                        unlit: true,
+                        cull_mode: None,
+                        ..default()
+                    });
+                    let glass = materials.add(StandardMaterial {
+                        base_color_texture: Some(tex),
+                        alpha_mode: AlphaMode::Blend,
+                        unlit: true,
+                        cull_mode: None,
+                        ..default()
+                    });
+                    host.block_mats = Some((cut, glass));
+                    info!("skycraft: Minecraft block atlas {w}x{h}");
+                }
+            }
+            REN_CLEAR_ALL => {
+                for (_, es) in host.sections.drain() {
+                    for e in es {
+                        commands.entity(e).despawn();
+                    }
+                }
+            }
+            REN_SECTION if bytes >= 16 => {
+                let mut sh = [0u8; 16];
+                link.read_bytes(at, &mut sh);
+                let i32_at = |o: usize| i32::from_le_bytes(sh[o..o + 4].try_into().unwrap());
+                let key = IVec3::new(i32_at(0), i32_at(4), i32_at(8));
+                let count = u32_at(&sh, 12) as usize;
+                if let Some(old) = host.sections.remove(&key) {
+                    for e in old {
+                        commands.entity(e).despawn();
+                    }
+                }
+                if count > 0 && bytes >= 16 + count as u64 * 32 {
+                    if let Some((cut, glass)) = host.block_mats.clone() {
+                        let mut raw = vec![0u8; count * 32];
+                        link.read_bytes(at + 16, &mut raw);
+                        let origin = from_mc(
+                            key.x as f64 * 16.0,
+                            key.y as f64 * 16.0,
+                            key.z as f64 * 16.0,
+                        );
+                        let mut spawned = Vec::new();
+                        for (translucent, mat) in [(false, cut), (true, glass)] {
+                            if let Some(mesh) = section_mesh(&raw, translucent) {
+                                spawned.push(
+                                    commands
+                                        .spawn((
+                                            McSection,
+                                            Mesh3d(meshes.add(mesh)),
+                                            MeshMaterial3d(mat),
+                                            Transform::from_translation(origin),
+                                        ))
+                                        .id(),
+                                );
+                            }
+                        }
+                        if host.ren_logged < 5 {
+                            host.ren_logged += 1;
+                            info!("skycraft: Minecraft blocks in section {key} ({count} vertices)");
+                        }
+                        host.sections.insert(key, spawned);
+                    }
+                }
+            }
+            _ => {}
+        }
+        tail += msg;
+        done += msg;
+    }
+    tail_a.store(tail, Ordering::Release);
+}
+
+/// One section's triangles of one pass as a mesh, in yards from the section's origin, with
+/// Minecraft's light (sky and block, its face shading) baked into the vertex colours.
+fn section_mesh(raw: &[u8], translucent: bool) -> Option<Mesh> {
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let ypb = yards_per_block();
+    let mut pos = Vec::new();
+    let mut uv = Vec::new();
+    let mut col = Vec::new();
+    let mut nrm = Vec::new();
+    for tri in raw.chunks_exact(96) {
+        let flags0 = u32_at(tri, 28);
+        if (flags0 & 2 != 0) != translucent {
+            continue;
+        }
+        for v in tri.chunks_exact(32) {
+            let f = |o: usize| f32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+            pos.push([f(0) * ypb, f(4) * ypb, f(8) * ypb]);
+            uv.push([f(12), f(16)]);
+            let c = u32_at(v, 20);
+            let light = u32_at(v, 24);
+            let face = (u32_at(v, 28) >> 4) & 7;
+            let (shade, n) = match face {
+                1 => (0.5, [0.0, -1.0, 0.0]),
+                2 => (1.0, [0.0, 1.0, 0.0]),
+                3 => (0.8, [0.0, 0.0, -1.0]),
+                4 => (0.8, [0.0, 0.0, 1.0]),
+                5 => (0.6, [-1.0, 0.0, 0.0]),
+                6 => (0.6, [1.0, 0.0, 0.0]),
+                _ => (1.0, [0.0, 1.0, 0.0]),
+            };
+            let lvl = ((light & 0xF).max((light >> 8) & 0xF)) as f32 / 15.0;
+            let k = shade * (0.3 + 0.7 * lvl);
+            let ch = |s: u32| {
+                let srgb = ((c >> s) & 0xFF) as f32 / 255.0 * k;
+                srgb.powf(2.2)
+            };
+            col.push([ch(0), ch(8), ch(16), ((c >> 24) & 0xFF) as f32 / 255.0]);
+            nrm.push(n);
+        }
+    }
+    if pos.is_empty() {
+        return None;
+    }
+    let n = pos.len() as u32;
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, nrm);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, col);
+    mesh.insert_indices(Indices::U32((0..n).collect()));
+    Some(mesh)
 }
 
 // ---- Minecraft's things ---------------------------------------------------------------------------
