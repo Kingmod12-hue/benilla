@@ -64,6 +64,8 @@ pub(super) fn control(
         Res<scoped_view::ScopedView>,
         // The loading cover blanks input at the source; a gesture in flight is unwound below.
         Res<crate::loading_screen::LoadingScreen>,
+        // SkyCraft: Minecraft's player, when it owns the body's position.
+        Res<crate::skycraft::ExternalPilot>,
     ),
     mut commands: Commands,
     mut player: ResMut<Player>,
@@ -621,6 +623,12 @@ pub(super) fn control(
                 mover_speeds.map_or(super::AIR_NUDGE_SPEED, |s| s.walk.min(s.run)),
             )
         };
+
+        // SkyCraft: Minecraft's physics moved the player; the avatar stands where it stands. The
+        // flags, animation and movement stream below still come from the same keys.
+        if let Some(mc) = speed_capsule.10.follow {
+            player.pos = mc.feet;
+        }
 
         // Traced here, the first point that knows both the latch and the mover's verdict.
         if let Some(k) = knockback {

@@ -42,6 +42,7 @@ mod combat_text;
 mod console;
 mod crash;
 mod creature_anim;
+mod craft;
 mod creature_type;
 mod cursor;
 mod cvars;
@@ -93,6 +94,7 @@ mod screen_fade;
 mod screenshot;
 mod script_calls;
 mod shaders;
+mod skycraft;
 
 mod game_tip;
 mod name_persist;

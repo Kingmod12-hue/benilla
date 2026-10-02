@@ -16,6 +16,7 @@ use bevy::ecs::system::ResMut;
 use bevy::math::{Dir3, Quat, Vec3};
 
 mod one_sided;
+pub use one_sided::FaceProbe;
 
 /// The collision audiences. avian puts every collider without explicit `CollisionLayers` on bit 0,
 /// [`CollisionLayer::Default`]; only WMO faces and liquid carry a layer.

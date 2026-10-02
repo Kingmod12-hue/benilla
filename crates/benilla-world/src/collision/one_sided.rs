@@ -474,6 +474,11 @@ pub struct FaceProbe {
 }
 
 impl FaceProbe {
+    /// World-space vertices, at the authored winding.
+    pub fn world_verts(&self) -> [Vec3; 3] {
+        self.verts
+    }
+
     /// Whether this face may block a sweep heading `dir`: [`cast_move`]'s gate.
     pub fn blocks(&self, dir: Vec3) -> bool {
         self.normal.dot(dir) <= FACING_EPS

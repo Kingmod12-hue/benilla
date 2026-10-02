@@ -250,6 +250,8 @@ impl PluginGroup for GamePlugins {
             .add(UiChatPlugin)
             .add(UiLayoutPlugin)
             .add(crate::screenshot::ScreenshotPlugin)
+            .add(crate::craft::CraftPlugin)
+            .add(crate::skycraft::SkyCraftPlugin)
     }
 }
 
