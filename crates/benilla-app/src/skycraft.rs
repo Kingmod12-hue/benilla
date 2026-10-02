@@ -317,6 +317,12 @@ pub(crate) struct McPlayer {
     pub(crate) feet: Vec3,
     pub(crate) eye: Vec3,
     pub(crate) on_ground: bool,
+    pub(crate) sprinting: bool,
+    /// Minecraft's effective vertical FOV (degrees), sprint widening included.
+    pub(crate) fov_deg: f32,
+    /// Walk-bob phase and amplitude, as Minecraft's `bobView` reads them.
+    pub(crate) bob_phase: f32,
+    pub(crate) bob_amount: f32,
 }
 
 /// What the player controller reads: when `Some`, the avatar stands where Minecraft's player does.
@@ -343,6 +349,8 @@ struct SkyHost {
     last_log: f32,
     in_world_logged: bool,
     last_flags: u32,
+    /// Minecraft's FOV while not sprinting: the base its sprint widening is measured from.
+    base_fov: f32,
 }
 
 pub(crate) struct SkyCraftPlugin;
@@ -360,6 +368,12 @@ impl Plugin for SkyCraftPlugin {
                 .chain()
                 .after(UiInput)
                 .before(crate::player::PlayerControlSet)
+                .in_set(InWorldGated),
+        )
+        .add_systems(
+            Update,
+            minecraft_camera
+                .after(crate::player::PlayerControlSet)
                 .in_set(InWorldGated),
         );
     }
@@ -526,10 +540,15 @@ fn host_frame(
             host.in_world_logged = true;
             info!("skycraft: following Minecraft's player");
         }
+        let f32_at = |o: usize| f32::from_le_bytes(mc[o..o + 4].try_into().unwrap());
         pilot.follow = Some(McPlayer {
             feet,
             eye,
             on_ground: mc_flags & (1 << 2) != 0,
+            sprinting: mc_flags & (1 << 4) != 0,
+            fov_deg: f32_at(0x40),
+            bob_phase: f32_at(0x44),
+            bob_amount: f32_at(0x48),
         });
     }
 }
@@ -791,4 +810,48 @@ fn harvest(
     let mut region = region_header(r, epoch, count);
     region.extend_from_slice(&blocks);
     (tris, region)
+}
+
+// ---- camera ------------------------------------------------------------------------------------
+
+/// In first person, the view is Minecraft's: its eye (the sneak dip), its walk bob, and its FOV
+/// changes (sprinting widens it), applied as a ratio to benilla's own FOV.
+fn minecraft_camera(
+    pilot: Res<ExternalPilot>,
+    mut host: ResMut<SkyHost>,
+    mut camera: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
+) {
+    let Some(mc) = pilot.follow else {
+        return;
+    };
+    let Ok((mut t, mut projection)) = camera.single_mut() else {
+        return;
+    };
+    if mc.fov_deg > 1.0 && (!mc.sprinting || host.base_fov <= 1.0) {
+        host.base_fov = if host.base_fov <= 1.0 {
+            mc.fov_deg
+        } else {
+            host.base_fov + (mc.fov_deg - host.base_fov) * 0.1
+        };
+    }
+    // Third person (the camera pulled back from the head) keeps benilla's own camera.
+    if t.translation.distance(mc.eye) > 1.5 {
+        return;
+    }
+    let g = -mc.bob_phase * std::f32::consts::PI;
+    let h = mc.bob_amount;
+    let right = t.right().as_vec3();
+    let up = t.up().as_vec3();
+    t.translation = mc.eye - right * (g.sin() * h * 0.5) + up * ((g.cos() * h).abs());
+    let roll = (g.sin() * h * 3.0).to_radians();
+    let nod = ((g - 0.2).cos() * h).abs() * 5.0;
+    let fwd = t.forward();
+    t.rotate_axis(fwd, -roll);
+    let side = t.right();
+    t.rotate_axis(side, -nod.to_radians());
+    if host.base_fov > 1.0 && mc.fov_deg > 1.0 {
+        if let Projection::Perspective(p) = &mut *projection {
+            p.fov = benilla_world::view::CAM_FOVY * (mc.fov_deg / host.base_fov).clamp(0.5, 1.5);
+        }
+    }
 }
