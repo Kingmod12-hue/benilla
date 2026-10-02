@@ -16,9 +16,12 @@
 
 use std::collections::HashMap;
 
+use bevy::asset::RenderAssetUsages;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::input::mouse::{AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::PrimaryWindow;
 
 use benilla_world::collision::{ColliderEpoch, GroundDecalSurface, WorldCollision};
@@ -28,7 +31,7 @@ use benilla_world::world_map::CurrentMap;
 use crate::char_select::InWorldGated;
 use crate::net::{TeleportMessage, WorldportMessage};
 use crate::player::Player;
-use crate::ui_script::{UiInput, UiKeyboardCapture};
+use crate::ui_script::{PointerOverUi, UiInput, UiKeyFeed, UiKeyboardCapture};
 
 /// Yards per Minecraft block: `SKYCRAFT_SCALE`, 1.3 by default, which puts Minecraft's sprint
 /// (5.6 blocks/s) at WoW's run speed (7 yd/s) and its walk at about 5.6 yd/s.
@@ -57,6 +60,8 @@ const OFF_RENDER_RING: usize = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * 3;
 const RENDER_RING_BYTES: usize = 64 << 20;
 const MAPPING_BYTES: usize = OFF_RENDER_RING + RENDER_RING_BYTES;
 const OFF_OVERLAY_CTL: usize = 0x300;
+const OFF_OVERLAY_SLOT_HDR: usize = 0x340;
+const OVERLAY_DIRTY: u32 = 1 << 2;
 const OFF_ACTOR_TABLE: usize = 0x12000;
 const OFF_WORLD_ENTITIES: usize = 0x1C000;
 
@@ -70,9 +75,14 @@ const SKY_IN_GAME: u32 = 1;
 const SKY_MENU_OPEN: u32 = 2;
 const SKY_LOADING: u32 = 4;
 const MC_IN_WORLD: u32 = 1;
+const MC_SCREEN_OPEN: u32 = 1 << 1;
 const MC_DEAD: u32 = 1 << 5;
 
 const IN_KEY: u16 = 1;
+const IN_MOUSE_BUTTON: u16 = 2;
+const IN_SCROLL: u16 = 3;
+const IN_CURSOR: u16 = 4;
+const IN_TEXT: u16 = 5;
 const IN_RELEASE_ALL: u16 = 6;
 
 const COL_PAD: u32 = 0;
@@ -126,6 +136,24 @@ fn tick_ms() -> u64 {
 #[cfg(not(windows))]
 fn tick_ms() -> u64 {
     0
+}
+
+/// QueryPerformanceCounter and its frequency: the clock Minecraft stamps its physics ticks with.
+#[cfg(windows)]
+fn qpc() -> (i64, i64) {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let (mut now, mut freq) = (0i64, 0i64);
+    unsafe {
+        QueryPerformanceCounter(&mut now);
+        QueryPerformanceFrequency(&mut freq);
+    }
+    (now, freq)
+}
+#[cfg(not(windows))]
+fn qpc() -> (i64, i64) {
+    (0, 0)
 }
 
 impl Mapping {
@@ -339,6 +367,9 @@ pub(crate) struct McPlayer {
 #[derive(Resource, Default)]
 pub(crate) struct ExternalPilot {
     pub(crate) follow: Option<McPlayer>,
+    /// Hold mouselook (the camera's TurnOrAction channel) while Minecraft drives and the cursor
+    /// is not wanted.
+    pub(crate) mouselook: bool,
 }
 
 #[derive(Resource, Default)]
@@ -361,6 +392,21 @@ struct SkyHost {
     last_flags: u32,
     /// Minecraft's FOV while not sprinting: the base its sprint widening is measured from.
     base_fov: f32,
+    /// The camera's yaw/pitch before the walk bob, recorded by [`minecraft_camera`]: what goes
+    /// back to Minecraft, so the bob never feeds into the look (the wobble).
+    look: Option<(f32, f32)>,
+    /// Minecraft's player drives ours this frame.
+    driving: bool,
+    /// A Minecraft screen (inventory, chat, pause) is open.
+    screen_open: bool,
+    /// Escape gave the cursor back to WoW (its menus); a click in the world takes it again.
+    esc_free: bool,
+    buttons_down: Vec<u16>,
+    scroll_carry: f32,
+    cursor_sent: (i32, i32),
+    /// The overlay triple buffer's front slot (ours), 2 after a reset.
+    overlay_front: u32,
+    overlay: Option<(Handle<Image>, UVec2)>,
 }
 
 pub(crate) struct SkyCraftPlugin;
@@ -372,9 +418,19 @@ impl Plugin for SkyCraftPlugin {
             return;
         }
         info!("skycraft: enabled (BENILLA_SKYCRAFT=1)");
-        app.init_resource::<SkyHost>().add_systems(
+        app.init_resource::<SkyHost>()
+            .add_systems(
+                Update,
+                claim_input
+                    .in_set(UiInput)
+                    .after(UiKeyFeed)
+                    .before(crate::bindings::BindingSet)
+                    .in_set(InWorldGated),
+            )
+            .add_systems(Update, show_overlay.after(host_frame))
+            .add_systems(
             Update,
-            (host_frame, forward_keys, stream_collision)
+            (host_frame, stream_collision)
                 .chain()
                 .after(UiInput)
                 .before(crate::player::PlayerControlSet)
@@ -389,17 +445,98 @@ impl Plugin for SkyCraftPlugin {
     }
 }
 
+/// SDL scancodes (USB HID usage ids), what SkyCraft's input ring carries.
 fn sdl_scancode(key: KeyCode) -> Option<u16> {
+    use KeyCode::*;
+    const LETTERS: [KeyCode; 26] = [
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
+        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
+    ];
+    const DIGITS: [KeyCode; 10] = [
+        Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Digit0,
+    ];
+    const FKEYS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
+    if let Some(i) = LETTERS.iter().position(|k| *k == key) {
+        return Some(4 + i as u16);
+    }
+    if let Some(i) = DIGITS.iter().position(|k| *k == key) {
+        return Some(30 + i as u16);
+    }
+    if let Some(i) = FKEYS.iter().position(|k| *k == key) {
+        return Some(58 + i as u16);
+    }
     Some(match key {
-        KeyCode::KeyW => 26,
-        KeyCode::KeyA => 4,
-        KeyCode::KeyS => 22,
-        KeyCode::KeyD => 7,
-        KeyCode::Space => 44,
-        KeyCode::ShiftLeft => 225,
-        KeyCode::ControlLeft => 224,
+        Enter | NumpadEnter => 40,
+        Escape => 41,
+        Backspace => 42,
+        Tab => 43,
+        Space => 44,
+        Minus => 45,
+        Equal => 46,
+        BracketLeft => 47,
+        BracketRight => 48,
+        Backslash => 49,
+        Semicolon => 51,
+        Quote => 52,
+        Backquote => 53,
+        Comma => 54,
+        Period => 55,
+        Slash => 56,
+        CapsLock => 57,
+        Insert => 73,
+        Home => 74,
+        PageUp => 75,
+        Delete => 76,
+        End => 77,
+        PageDown => 78,
+        ArrowRight => 79,
+        ArrowLeft => 80,
+        ArrowDown => 81,
+        ArrowUp => 82,
+        ControlLeft => 224,
+        ShiftLeft => 225,
+        ControlRight => 228,
+        ShiftRight => 229,
         _ => return None,
     })
+}
+
+/// Keys Minecraft drives the player with: mirrored, and WoW still sees them (its move flags).
+fn shared_key(key: KeyCode) -> bool {
+    matches!(
+        key,
+        KeyCode::KeyW
+            | KeyCode::KeyA
+            | KeyCode::KeyS
+            | KeyCode::KeyD
+            | KeyCode::Space
+            | KeyCode::ShiftLeft
+            | KeyCode::ControlLeft
+    )
+}
+
+/// Keys that are Minecraft's alone while it drives: the hotbar, inventory, drop, swap hands, its
+/// chat and commands, its camera (F5). WoW's bindings never see them.
+fn minecraft_key(key: KeyCode) -> bool {
+    use KeyCode::*;
+    matches!(
+        key,
+        Digit1
+            | Digit2
+            | Digit3
+            | Digit4
+            | Digit5
+            | Digit6
+            | Digit7
+            | Digit8
+            | Digit9
+            | KeyE
+            | KeyQ
+            | KeyF
+            | KeyT
+            | Slash
+            | F5
+    )
 }
 
 fn to_mc(v: Vec3) -> [f64; 3] {
@@ -440,6 +577,8 @@ fn host_frame(
         host.teleport_seq = (tick_ms() % 100_000) as u32 + 2;
     }
     pilot.follow = None;
+    host.driving = false;
+    host.screen_open = false;
     let Some(link) = host.link else {
         return;
     };
@@ -465,6 +604,12 @@ fn host_frame(
     }
     if new_guest || world_changed {
         host.mc_pid = pid;
+        if new_guest {
+            // A fresh writer starts its triple buffer over (SkyCraft's ResetOverlay).
+            link.atomic_u32(OFF_OVERLAY_CTL)
+                .store(0, std::sync::atomic::Ordering::Release);
+            host.overlay_front = 2;
+        }
         host.epoch = host.epoch.wrapping_add(1).max(1);
         host.sent.clear();
         host.teleport_pending = true;
@@ -476,7 +621,7 @@ fn host_frame(
     }
 
     // The look: benilla's camera, as Minecraft yaw/pitch (degrees; yaw 0 = +Z, pitch + = down).
-    let (yaw, pitch) = camera
+    let (yaw, pitch) = host.look.take().map(Ok).unwrap_or_else(|| camera
         .single()
         .map(|t| {
             let f = t.forward().as_vec3();
@@ -484,7 +629,7 @@ fn host_frame(
                 (-f.x).atan2(f.z).to_degrees(),
                 (-f.y).clamp(-1.0, 1.0).asin().to_degrees(),
             )
-        })
+        }))
         .unwrap_or((0.0, 0.0));
     let (vw, vh) = window
         .single()
@@ -525,9 +670,34 @@ fn host_frame(
     };
     let mc_flags = u32_at(&mc, 4);
     let ack = u32_at(&mc, 0x30);
-    let feet = from_mc(f64_at(&mc, 0x08), f64_at(&mc, 0x10), f64_at(&mc, 0x18));
-    let eye = from_mc(f64_at(&mc, 0x50), f64_at(&mc, 0x58), f64_at(&mc, 0x60));
+    let f32_at = |o: usize| f32::from_le_bytes(mc[o..o + 4].try_into().unwrap());
+    let mut feet = from_mc(f64_at(&mc, 0x08), f64_at(&mc, 0x10), f64_at(&mc, 0x18));
+    let mut eye = from_mc(f64_at(&mc, 0x50), f64_at(&mc, 0x58), f64_at(&mc, 0x60));
+    let mut bob_phase = f32_at(0x44);
+    let mut bob_amount = f32_at(0x48);
+    // Interpolate Minecraft's 20 Hz physics ticks on our own frame clock, as Minecraft's renderer
+    // does with its partial tick: the interpolated fields above were taken at Minecraft's frame,
+    // whose phase against ours wanders (the judder).
+    let tick_qpc = i64::from_le_bytes(mc[0x68..0x70].try_into().unwrap());
+    let tick_ms_mc = f32_at(0xB8);
+    let (now_qpc, freq) = qpc();
+    if tick_qpc > 0 && freq > 0 && tick_ms_mc > 1.0 && f64_at(&mc, 0x88) != 0.0 {
+        let elapsed_ms = (now_qpc - tick_qpc) as f64 * 1000.0 / freq as f64;
+        let a = (elapsed_ms / tick_ms_mc as f64).clamp(0.0, 1.0);
+        let lerp = |o: usize| f64_at(&mc, o) + (f64_at(&mc, o + 0x18) - f64_at(&mc, o)) * a;
+        feet = from_mc(lerp(0x70), lerp(0x78), lerp(0x80));
+        let af = a as f32;
+        let eye_h = f32_at(0xA0) + (f32_at(0xA4) - f32_at(0xA0)) * af;
+        // Only in first person does the camera sit at the eye; keep Minecraft's own otherwise.
+        if u32_at(&mc, 0xC0) == 0 {
+            eye = feet + Vec3::Y * eye_h * yards_per_block();
+        }
+        let (walk_o, walk) = (f32_at(0xA8), f32_at(0xAC));
+        bob_phase = walk + (walk - walk_o) * af;
+        bob_amount = f32_at(0xB0) + (f32_at(0xB4) - f32_at(0xB0)) * af;
+    }
     let in_world = mc_flags & MC_IN_WORLD != 0;
+    host.screen_open = in_world && mc_flags & MC_SCREEN_OPEN != 0;
     if mc_flags != host.last_flags {
         info!(
             "skycraft: mc flags {:#x} -> {mc_flags:#x} (sneaking {}, sprinting {})",
@@ -550,47 +720,89 @@ fn host_frame(
             host.in_world_logged = true;
             info!("skycraft: following Minecraft's player");
         }
-        let f32_at = |o: usize| f32::from_le_bytes(mc[o..o + 4].try_into().unwrap());
+        host.driving = true;
         pilot.follow = Some(McPlayer {
             feet,
             eye,
             on_ground: mc_flags & (1 << 2) != 0,
             sprinting: mc_flags & (1 << 4) != 0,
             fov_deg: f32_at(0x40),
-            bob_phase: f32_at(0x44),
-            bob_amount: f32_at(0x48),
+            bob_phase,
+            bob_amount,
         });
     }
 }
 
-/// Mirrors the movement keys to Minecraft (benilla still sees them too, for its own move flags).
-fn forward_keys(
+/// Minecraft's input while it drives, claimed between the UI's key feed and WoW's bindings:
+/// the movement keys are mirrored (WoW keeps them for its move flags), Minecraft's own keys
+/// (hotbar, inventory, drop, ...) and, with a Minecraft screen up, every key go to Minecraft only.
+/// The mouse buttons and wheel are Minecraft's while the look is held or a screen is open, and the
+/// cursor position while a screen is open. Holding Alt, or Escape (WoW's menu), frees the cursor
+/// for WoW; a click in the world takes it back.
+#[allow(clippy::too_many_arguments)]
+fn claim_input(
     mut host: ResMut<SkyHost>,
-    mut keys: MessageReader<KeyboardInput>,
-    typing: Res<UiKeyboardCapture>,
+    mut pilot: ResMut<ExternalPilot>,
+    mut keyboard: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut scroll: ResMut<AccumulatedMouseScroll>,
+    mut capture: ResMut<UiKeyboardCapture>,
+    over_ui: Res<PointerOverUi>,
+    window: Query<&Window, With<PrimaryWindow>>,
 ) {
     let Some(link) = host.link else {
-        keys.clear();
+        keyboard.clear();
+        pilot.mouselook = false;
         return;
     };
-    let typing_now = typing.typing;
+    let typing = capture.typing;
+    let screen = host.screen_open && host.driving;
     let mut down = std::mem::take(&mut host.keys_down);
-    if typing_now && !host.typing_was {
-        link.push_input(IN_RELEASE_ALL, 0, 0, 0, 0);
+    if !host.driving || (typing && !host.typing_was) {
+        if !down.is_empty() || !host.buttons_down.is_empty() {
+            link.push_input(IN_RELEASE_ALL, 0, 0, 0, 0);
+        }
         down.clear();
+        host.buttons_down.clear();
     }
-    for ev in keys.read() {
+    host.typing_was = typing;
+    if !host.driving {
+        keyboard.clear();
+        host.keys_down = down;
+        pilot.mouselook = false;
+        return;
+    }
+
+    // ---- keys ----
+    for ev in keyboard.read() {
+        let pressed = ev.state == ButtonState::Pressed;
+        if typing && pressed {
+            continue;
+        }
+        if pressed && !screen && ev.key_code == KeyCode::Escape {
+            // WoW's Escape (its menu ladder) runs; the cursor is WoW's until a world click.
+            host.esc_free = !host.esc_free;
+            continue;
+        }
+        let ours = screen || minecraft_key(ev.key_code);
+        if !ours && !shared_key(ev.key_code) {
+            continue;
+        }
+        if ours && pressed {
+            capture.consumed.push(ev.key_code);
+        }
+        if screen && pressed {
+            if let Some(text) = &ev.text {
+                for ch in text.chars().filter(|c| !c.is_control()) {
+                    link.push_input(IN_TEXT, 0, ch as i32, 0, 0);
+                }
+            }
+        }
         let Some(code) = sdl_scancode(ev.key_code) else {
             continue;
         };
-        let pressed = ev.state == ButtonState::Pressed;
-        if typing_now && pressed {
-            continue;
-        }
         let was = down.contains(&code);
-        if code >= 224 && pressed != was {
-            info!("skycraft: key {code} {}", if pressed { "down" } else { "up" });
-        }
         if pressed && !was {
             down.push(code);
             link.push_input(IN_KEY, code, 1, 0, 0);
@@ -600,7 +812,182 @@ fn forward_keys(
         }
     }
     host.keys_down = down;
-    host.typing_was = typing_now;
+
+    // ---- the cursor's owner ----
+    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    if host.esc_free && !alt && !over_ui.0 && buttons.just_pressed(MouseButton::Left) {
+        host.esc_free = false;
+        // This click only takes the cursor back.
+        pilot.mouselook = true;
+        return;
+    }
+    let look = !screen && !typing && !alt && !host.esc_free;
+    pilot.mouselook = look;
+    let route = look || screen;
+
+    // ---- mouse buttons ----
+    for (button, sdl) in [
+        (MouseButton::Left, 1u16),
+        (MouseButton::Middle, 2),
+        (MouseButton::Right, 3),
+    ] {
+        let held = host.buttons_down.contains(&sdl);
+        if route && buttons.just_pressed(button) && !held {
+            host.buttons_down.push(sdl);
+            link.push_input(IN_MOUSE_BUTTON, sdl, 1, 0, 0);
+        } else if held && (!buttons.pressed(button) || !route) {
+            host.buttons_down.retain(|b| *b != sdl);
+            link.push_input(IN_MOUSE_BUTTON, sdl, 0, 0, 0);
+        }
+    }
+
+    // ---- wheel: Minecraft's hotbar instead of WoW's zoom ----
+    if route && scroll.delta.y != 0.0 {
+        let notches = match scroll.unit {
+            MouseScrollUnit::Line => scroll.delta.y,
+            MouseScrollUnit::Pixel => scroll.delta.y / 100.0,
+        };
+        host.scroll_carry += notches;
+        while host.scroll_carry >= 1.0 {
+            host.scroll_carry -= 1.0;
+            link.push_input(IN_SCROLL, 0, 120, 0, 0);
+        }
+        while host.scroll_carry <= -1.0 {
+            host.scroll_carry += 1.0;
+            link.push_input(IN_SCROLL, 0, -120, 0, 0);
+        }
+        scroll.delta = Vec2::ZERO;
+    }
+
+    // ---- the cursor, in overlay pixels, while a screen is open ----
+    if screen {
+        if let Ok(w) = window.single() {
+            if let Some(p) = w.physical_cursor_position() {
+                let (ow, oh) = host
+                    .overlay
+                    .as_ref()
+                    .map(|(_, s)| (s.x as f32, s.y as f32))
+                    .unwrap_or((w.physical_width() as f32, w.physical_height() as f32));
+                let x = (p.x * ow / w.physical_width().max(1) as f32) as i32;
+                let y = (p.y * oh / w.physical_height().max(1) as f32) as i32;
+                if (x, y) != host.cursor_sent {
+                    host.cursor_sent = (x, y);
+                    link.push_input(IN_CURSOR, 0, x, y, 0);
+                }
+            }
+        }
+    }
+}
+
+// ---- overlay ------------------------------------------------------------------------------------
+
+#[derive(Component)]
+struct McOverlay;
+
+/// Minecraft's HUD, hand and screens, drawn over the world: the newest frame of SkyCraft's overlay
+/// triple buffer, copied into a full-window UI image. Minecraft's pixels are premultiplied; Bevy's
+/// UI blends straight alpha, so they are divided back out.
+fn show_overlay(
+    mut commands: Commands,
+    mut host: ResMut<SkyHost>,
+    mut images: ResMut<Assets<Image>>,
+    mut nodes: Query<(&mut Visibility, &mut ImageNode), With<McOverlay>>,
+) {
+    use std::sync::atomic::Ordering;
+    let visible = host.driving;
+    for (mut v, _) in &mut nodes {
+        *v = if visible { Visibility::Inherited } else { Visibility::Hidden };
+    }
+    let Some(link) = host.link else {
+        return;
+    };
+    if !visible {
+        return;
+    }
+    let ctl = link.atomic_u32(OFF_OVERLAY_CTL);
+    if ctl.load(Ordering::Acquire) & OVERLAY_DIRTY == 0 {
+        return;
+    }
+    let old = ctl.swap(host.overlay_front, Ordering::AcqRel);
+    host.overlay_front = old & 3;
+    let slot = host.overlay_front as usize;
+    if slot > 2 {
+        return;
+    }
+    let hdr = OFF_OVERLAY_SLOT_HDR + slot * 0x40;
+    let w = link.atomic_u32(hdr).load(Ordering::Relaxed);
+    let h = link.atomic_u32(hdr + 4).load(Ordering::Relaxed);
+    let bottom_up = link.atomic_u32(hdr + 8).load(Ordering::Relaxed) & 1 != 0;
+    if w == 0 || h == 0 || w > 3840 || h > 2160 {
+        return;
+    }
+    let size = UVec2::new(w, h);
+    if host.overlay.as_ref().map(|(_, s)| *s) != Some(size) {
+        let image = Image::new_fill(
+            Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        let handle = images.add(image);
+        if nodes.is_empty() {
+            commands.spawn((
+                McOverlay,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                ImageNode::new(handle.clone()),
+                GlobalZIndex(5),
+            ));
+        } else {
+            for (_, mut node) in &mut nodes {
+                node.image = handle.clone();
+            }
+        }
+        if let Some((old, _)) = host.overlay.take() {
+            images.remove(&old);
+        }
+        info!("skycraft: overlay {w}x{h}");
+        host.overlay = Some((handle, size));
+    }
+    let Some((handle, _)) = host.overlay.as_ref() else {
+        return;
+    };
+    let Some(mut image) = images.get_mut(handle) else {
+        return;
+    };
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+    let row = w as usize * 4;
+    let src = OFF_OVERLAY_PIXELS + slot * OVERLAY_SLOT_BYTES;
+    for y in 0..h as usize {
+        let sy = if bottom_up { h as usize - 1 - y } else { y };
+        let dst = &mut data[y * row..(y + 1) * row];
+        link.read_bytes(src + sy * row, dst);
+        for px in dst.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a == 0 {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+            } else if a < 255 {
+                for c in &mut px[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+    }
 }
 
 // ---- collision export ----------------------------------------------------------------------------
@@ -848,6 +1235,12 @@ fn minecraft_camera(
     if t.translation.distance(mc.eye) > 2.0 {
         return;
     }
+    // The look before the bob is what goes back to Minecraft next frame.
+    let f = t.forward().as_vec3();
+    host.look = Some((
+        (-f.x).atan2(f.z).to_degrees(),
+        (-f.y).clamp(-1.0, 1.0).asin().to_degrees(),
+    ));
     let g = -mc.bob_phase * std::f32::consts::PI;
     let h = mc.bob_amount;
     let right = t.right().as_vec3();

@@ -627,6 +627,8 @@ pub(super) struct WorldMouse {
     scripted_rise: bool,
     /// A `MouselookStart`/`Stop` ran this frame; each disarms the pending click (`0x514810(0)`).
     disarmed: bool,
+    /// SkyCraft holds the TurnOrAction channel (permanent mouselook while Minecraft drives).
+    sky_forced: bool,
 }
 
 impl WorldMouse {
@@ -713,6 +715,7 @@ pub(super) fn latch_world_mouse(
     window: Single<&Window, With<PrimaryWindow>>,
     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
+    pilot: Res<crate::skycraft::ExternalPilot>,
 ) {
     let calls = script
         .as_mut()
@@ -740,6 +743,17 @@ pub(super) fn latch_world_mouse(
     // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
     if cover.is_some_and(|c| c.covering()) {
         wm.scripted = false;
+    }
+    // SkyCraft (not 1.12): while Minecraft drives the player the look is permanent, as in
+    // Minecraft; it lets go when the cursor is wanted (a Minecraft screen, Alt, Escape).
+    if pilot.mouselook {
+        if !wm.scripted {
+            wm.mouselook(true);
+        }
+        wm.sky_forced = true;
+    } else if wm.sky_forced {
+        wm.sky_forced = false;
+        wm.mouselook(false);
     }
     // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
     if let Some(mut script) = script {

@@ -103,6 +103,11 @@ pub(crate) struct PlayerUiHover(pub(crate) Option<u32>);
 /// it ate. Neither releases a held key: only the window deactivate (`0x514490`, from `0x493058`)
 /// and the world-enter cascade (`0x5144c0`) clear the direction bits, so W keeps running while
 /// you type.
+/// The UI's key and pointer feed inside [`UiInput`]; SkyCraft claims Minecraft's keys after it
+/// and before the bindings run.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UiKeyFeed;
+
 #[derive(Resource, Default)]
 pub(crate) struct UiKeyboardCapture {
     /// A focused EditBox eats every key (`0x77b35e` returns 1 on every path but alt-arrow).
@@ -323,7 +328,9 @@ impl Plugin for UiScriptPlugin {
                 Update,
                 (
                     extract::tick_script,
-                    input::feed_ui_input.in_set(crate::char_select::InWorldGated),
+                    input::feed_ui_input
+                        .in_set(crate::char_select::InWorldGated)
+                        .in_set(UiKeyFeed),
                 )
                     .chain()
                     .in_set(UiInput)
