@@ -457,7 +457,20 @@ struct SkyHost {
     actors: HashMap<u32, (Entity, u64, u32, u32)>,
     /// Our own health last frame, for mirroring WoW's hits onto Minecraft's hearts.
     last_health: Option<u32>,
+    /// Minecraft's arrows and dropped items as drawn here: MC entity id to ours.
+    shown: HashMap<u32, Entity>,
+    things: Option<ThingAssets>,
 }
+
+/// Stand-in meshes for Minecraft's things (arrows, tridents, dropped items).
+struct ThingAssets {
+    arrow: (Handle<Mesh>, Handle<StandardMaterial>),
+    trident: (Handle<Mesh>, Handle<StandardMaterial>),
+    item: (Handle<Mesh>, Handle<StandardMaterial>),
+}
+
+#[derive(Component)]
+struct McThing;
 
 pub(crate) struct SkyCraftPlugin;
 
@@ -479,6 +492,7 @@ impl Plugin for SkyCraftPlugin {
             )
             .add_systems(Update, show_overlay.after(host_frame))
             .add_systems(Update, combat.after(host_frame).in_set(InWorldGated))
+            .add_systems(Update, show_things.after(host_frame))
             .add_systems(
             Update,
             (host_frame, stream_collision)
@@ -1017,7 +1031,9 @@ fn combat(
         let fwd = tf.rotation() * Vec3::NEG_Z;
         let yaw = (-fwd.x).atan2(fwd.z).to_degrees();
         let scale = ne.scale.max(0.1);
-        let radius = f.unit_bounding_radius().max(0.4) * scale;
+        // As wide as WoW's own melee reach would make it (combat reach), so a sword hits
+        // about where WoW's would; never thinner than the model.
+        let radius = f.unit_bounding_radius().max(f.unit_combat_reach() * 0.75).max(0.4) * scale;
         let width = (radius * 2.0 / ypb).clamp(0.3, 6.0);
         let tall = height.map(|h| h.0).filter(|h| *h > 0.1).unwrap_or(2.0 * scale);
         let tall = (tall / ypb).clamp(0.3, 12.0);
@@ -1102,6 +1118,104 @@ fn combat(
         }
         host.last_health = Some(hp);
     }
+}
+
+// ---- Minecraft's things ---------------------------------------------------------------------------
+
+/// Minecraft's arrows, tridents and dropped items (the world-entity table, a seqlock), drawn as
+/// simple shapes where Minecraft has them, so a shot can be followed and its landing seen.
+fn show_things(
+    mut commands: Commands,
+    mut host: ResMut<SkyHost>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut things: Query<&mut Transform, With<McThing>>,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(link) = host.link else {
+        return;
+    };
+    let mut table: Vec<(u32, u32, Vec3, f32, f32)> = Vec::new();
+    if host.driving {
+        let seq = link.atomic_u32(OFF_WORLD_ENTITIES);
+        for _ in 0..16 {
+            let s1 = seq.load(Ordering::Acquire);
+            if s1 & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            table.clear();
+            let count = (link.atomic_u32(OFF_WORLD_ENTITIES + 4).load(Ordering::Relaxed) as usize).min(160);
+            let mut e = [0u8; 32];
+            for i in 0..count {
+                link.read_bytes(OFF_WORLD_ENTITIES + 0x40 + i * 96, &mut e);
+                let kind = u32_at(&e, 0);
+                if !matches!(kind, 1..=4) {
+                    continue;
+                }
+                let f = |o: usize| f32::from_le_bytes(e[o..o + 4].try_into().unwrap());
+                let pos = from_mc(f(8) as f64, f(12) as f64, f(16) as f64);
+                table.push((u32_at(&e, 4), kind, pos, f(20), f(24)));
+            }
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s1 {
+                break;
+            }
+        }
+    }
+    if host.things.is_none() {
+        let ypb = yards_per_block();
+        let mut mat = |c: Color| {
+            materials.add(StandardMaterial {
+                base_color: c,
+                unlit: true,
+                ..default()
+            })
+        };
+        let arrow_m = mat(Color::srgb(0.55, 0.42, 0.25));
+        let trident_m = mat(Color::srgb(0.35, 0.65, 0.6));
+        let item_m = mat(Color::srgb(0.85, 0.85, 0.8));
+        host.things = Some(ThingAssets {
+            arrow: (meshes.add(Cuboid::new(0.06 * ypb, 0.06 * ypb, 0.7 * ypb)), arrow_m),
+            trident: (meshes.add(Cuboid::new(0.08 * ypb, 0.08 * ypb, 1.0 * ypb)), trident_m),
+            item: (meshes.add(Cuboid::new(0.25 * ypb, 0.25 * ypb, 0.25 * ypb)), item_m),
+        });
+    }
+    let mut seen = Vec::with_capacity(table.len());
+    for (id, kind, pos, yaw, pitch) in table {
+        seen.push(id);
+        // Arrows face (sin yaw, sin pitch, cos yaw) in Minecraft, our axes too; items spin on yaw.
+        let rot = if matches!(kind, 1 | 3) {
+            let (y, p) = (yaw.to_radians(), pitch.to_radians());
+            let dir = Vec3::new(y.sin() * p.cos(), p.sin(), y.cos() * p.cos());
+            Quat::from_rotation_arc(Vec3::Z, dir.normalize_or(Vec3::Z))
+        } else {
+            Quat::from_rotation_y(yaw.to_radians())
+        };
+        let lift = if matches!(kind, 2 | 4) { 0.125 * yards_per_block() } else { 0.0 };
+        let tf = Transform::from_translation(pos + Vec3::Y * lift).with_rotation(rot);
+        if let Some(&e) = host.shown.get(&id) {
+            if let Ok(mut t) = things.get_mut(e) {
+                *t = tf;
+                continue;
+            }
+        }
+        let a = host.things.as_ref().unwrap();
+        let (mesh, mat) = match kind {
+            1 => a.arrow.clone(),
+            3 => a.trident.clone(),
+            _ => a.item.clone(),
+        };
+        let e = commands.spawn((McThing, Mesh3d(mesh), MeshMaterial3d(mat), tf)).id();
+        host.shown.insert(id, e);
+    }
+    host.shown.retain(|id, e| {
+        let keep = seen.contains(id);
+        if !keep {
+            commands.entity(*e).despawn();
+        }
+        keep
+    });
 }
 
 // ---- overlay ------------------------------------------------------------------------------------
