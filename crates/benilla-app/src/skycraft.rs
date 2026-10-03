@@ -876,7 +876,16 @@ fn claim_input(
         if ours && pressed {
             capture.consumed.push(ev.key_code);
         }
-        if screen && pressed {
+        // Ctrl/Alt chords are commands (Ctrl+V pastes), not typed text: Minecraft gets the keys.
+        let chord = keys.any_pressed([
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+            KeyCode::AltLeft,
+            KeyCode::AltRight,
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ]);
+        if screen && pressed && !chord {
             if let Some(text) = &ev.text {
                 for ch in text.chars().filter(|c| !c.is_control()) {
                     link.push_input(IN_TEXT, 0, ch as i32, 0, 0);
