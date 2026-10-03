@@ -468,6 +468,13 @@ struct SkyHost {
     block_mats: Option<(Handle<StandardMaterial>, Handle<StandardMaterial>)>,
     sections: HashMap<IVec3, Vec<Entity>>,
     ren_logged: u32,
+    /// Minecraft's entity textures (skins of mobs, horses, armour...) by its id: cut-out and
+    /// translucent materials.
+    ent_mats: HashMap<u32, (Handle<StandardMaterial>, Handle<StandardMaterial>)>,
+    /// The scene (every Minecraft creature, item and particle this frame), one reused entity and
+    /// mesh per (texture, translucent) batch group.
+    scene_pool: HashMap<(u32, bool), (Entity, Handle<Mesh>, Handle<StandardMaterial>)>,
+    scene_logged: bool,
 }
 
 /// Stand-in meshes for Minecraft's things (arrows, tridents, dropped items).
@@ -1138,6 +1145,8 @@ const REN_PAD: u32 = 0;
 const REN_ATLAS: u32 = 1;
 const REN_SECTION: u32 = 2;
 const REN_CLEAR_ALL: u32 = 3;
+const REN_TEXTURE: u32 = 4;
+const REN_SCENE: u32 = 6;
 /// How much of the render ring one frame may consume (the rest waits a frame).
 const REN_BUDGET: u64 = 24 << 20;
 
@@ -1166,6 +1175,8 @@ fn draw_blocks(
     let data = OFF_RENDER_RING + RING_DATA;
     let mut done = 0u64;
     let mut hdr = [0u8; 8];
+    // Only the newest scene this frame is drawn: (where its payload starts, its size).
+    let mut scene: Option<(usize, u64)> = None;
     while tail < head && done < REN_BUDGET {
         let pos = tail % size;
         if size - pos < 8 {
@@ -1202,22 +1213,33 @@ fn draw_blocks(
                     );
                     image.sampler = bevy::image::ImageSampler::nearest();
                     let tex = images.add(image);
-                    let cut = materials.add(StandardMaterial {
-                        base_color_texture: Some(tex.clone()),
-                        alpha_mode: AlphaMode::Mask(0.5),
-                        unlit: true,
-                        cull_mode: None,
-                        ..default()
-                    });
-                    let glass = materials.add(StandardMaterial {
-                        base_color_texture: Some(tex),
-                        alpha_mode: AlphaMode::Blend,
-                        unlit: true,
-                        cull_mode: None,
-                        ..default()
-                    });
-                    host.block_mats = Some((cut, glass));
+                    host.block_mats = Some(block_materials(&mut materials, tex));
                     info!("skycraft: Minecraft block atlas {w}x{h}");
+                }
+            }
+            REN_SCENE if bytes >= 32 => scene = Some((at, bytes)),
+            REN_TEXTURE if bytes >= 16 => {
+                let mut th = [0u8; 16];
+                link.read_bytes(at, &mut th);
+                let (id, w, h) = (u32_at(&th, 0), u32_at(&th, 4), u32_at(&th, 8));
+                if w > 0 && h > 0 && w <= 8192 && h <= 8192 && bytes >= 16 + w as u64 * h as u64 * 4 {
+                    let mut px = vec![0u8; (w * h * 4) as usize];
+                    link.read_bytes(at + 16, &mut px);
+                    let mut image = Image::new(
+                        Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        TextureDimension::D2,
+                        px,
+                        TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::RENDER_WORLD,
+                    );
+                    image.sampler = bevy::image::ImageSampler::nearest();
+                    let tex = images.add(image);
+                    let mats = block_materials(&mut materials, tex);
+                    host.ent_mats.insert(id, mats);
                 }
             }
             REN_CLEAR_ALL => {
@@ -1275,12 +1297,131 @@ fn draw_blocks(
         tail += msg;
         done += msg;
     }
+    if let Some((at, bytes)) = scene {
+        draw_scene(&mut commands, &mut host, link, at, bytes, &mut meshes);
+    } else if !host.driving {
+        for (e, _, _) in host.scene_pool.values() {
+            commands.entity(*e).insert(Visibility::Hidden);
+        }
+    }
     tail_a.store(tail, Ordering::Release);
+}
+
+/// A texture's two materials: cut-out (alpha-tested) and translucent (blended), unlit (the
+/// light is in the vertex colours) and two-sided.
+fn block_materials(
+    materials: &mut Assets<StandardMaterial>,
+    tex: Handle<Image>,
+) -> (Handle<StandardMaterial>, Handle<StandardMaterial>) {
+    let cut = materials.add(StandardMaterial {
+        base_color_texture: Some(tex.clone()),
+        alpha_mode: AlphaMode::Mask(0.5),
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    let glass = materials.add(StandardMaterial {
+        base_color_texture: Some(tex),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    (cut, glass)
+}
+
+/// Every Minecraft creature, dropped item and particle this frame (horses, mobs, leads...), as
+/// Minecraft's entity renderer posed them: one mesh per texture and pass, rebuilt each frame.
+fn draw_scene(
+    commands: &mut Commands,
+    host: &mut SkyHost,
+    link: Mapping,
+    at: usize,
+    bytes: u64,
+    meshes: &mut Assets<Mesh>,
+) {
+    let mut head = [0u8; 32];
+    link.read_bytes(at, &mut head);
+    let origin = from_mc(f64_at(&head, 0), f64_at(&head, 8), f64_at(&head, 16));
+    let batches = u32_at(&head, 24) as usize;
+    let verts = u32_at(&head, 28) as usize;
+    if bytes < 32 + batches as u64 * 16 + verts as u64 * 32 || batches > 100_000 {
+        return;
+    }
+    let mut bt = vec![0u8; batches * 16];
+    link.read_bytes(at + 32, &mut bt);
+    let mut raw = vec![0u8; verts * 32];
+    link.read_bytes(at + 32 + batches * 16, &mut raw);
+    if !host.scene_logged && batches > 0 {
+        host.scene_logged = true;
+        info!("skycraft: Minecraft scene: {batches} batches, {verts} vertices");
+    }
+    // Group the batches' vertices by (texture, translucent).
+    let mut groups: HashMap<(u32, bool), Vec<u8>> = HashMap::new();
+    for b in bt.chunks_exact(16) {
+        let (tex, first, count, flags) =
+            (u32_at(b, 0), u32_at(b, 4) as usize, u32_at(b, 8) as usize, u32_at(b, 12));
+        if first + count > verts {
+            continue;
+        }
+        groups
+            .entry((tex, flags & 1 != 0))
+            .or_default()
+            .extend_from_slice(&raw[first * 32..(first + count) * 32]);
+    }
+    let mut used = Vec::new();
+    for (key, data) in groups {
+        let mats = if key.0 == 0 {
+            host.block_mats.clone()
+        } else {
+            host.ent_mats.get(&key.0).cloned()
+        };
+        let Some((cut, glass)) = mats else {
+            continue;
+        };
+        let mat = if key.1 { glass } else { cut };
+        let Some(mesh) = vertex_mesh(&data, None, RenderAssetUsages::default()) else {
+            continue;
+        };
+        used.push(key);
+        let tf = Transform::from_translation(origin);
+        match host.scene_pool.get_mut(&key) {
+            Some((e, h, m)) => {
+                if let Some(slot) = meshes.get_mut(&*h) {
+                    *slot = mesh;
+                }
+                let mut ec = commands.entity(*e);
+                ec.insert((tf, Visibility::Inherited));
+                if *m != mat {
+                    ec.insert(MeshMaterial3d(mat.clone()));
+                    *m = mat;
+                }
+            }
+            None => {
+                let h = meshes.add(mesh);
+                let e = commands
+                    .spawn((McSection, Mesh3d(h.clone()), MeshMaterial3d(mat.clone()), tf))
+                    .id();
+                host.scene_pool.insert(key, (e, h, mat));
+            }
+        }
+    }
+    for (key, (e, _, _)) in host.scene_pool.iter() {
+        if !used.contains(key) {
+            commands.entity(*e).insert(Visibility::Hidden);
+        }
+    }
 }
 
 /// One section's triangles of one pass as a mesh, in yards from the section's origin, with
 /// Minecraft's light (sky and block, its face shading) baked into the vertex colours.
 fn section_mesh(raw: &[u8], translucent: bool) -> Option<Mesh> {
+    vertex_mesh(raw, Some(translucent), RenderAssetUsages::RENDER_WORLD)
+}
+
+/// Minecraft vertices (`RenVertex`, triangles) as a mesh in yards; `pass` keeps only the
+/// translucent (or only the other) triangles.
+fn vertex_mesh(raw: &[u8], pass: Option<bool>, usage: RenderAssetUsages) -> Option<Mesh> {
     use bevy::mesh::{Indices, PrimitiveTopology};
     let ypb = yards_per_block();
     let mut pos = Vec::new();
@@ -1289,7 +1430,7 @@ fn section_mesh(raw: &[u8], translucent: bool) -> Option<Mesh> {
     let mut nrm = Vec::new();
     for tri in raw.chunks_exact(96) {
         let flags0 = u32_at(tri, 28);
-        if (flags0 & 2 != 0) != translucent {
+        if pass.is_some_and(|t| (flags0 & 2 != 0) != t) {
             continue;
         }
         for v in tri.chunks_exact(32) {
@@ -1322,7 +1463,7 @@ fn section_mesh(raw: &[u8], translucent: bool) -> Option<Mesh> {
         return None;
     }
     let n = pos.len() as u32;
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, usage);
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, nrm);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
