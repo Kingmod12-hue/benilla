@@ -376,11 +376,18 @@ pub(super) fn control(
         // Face that way and hold "forward": the server then hears a normal run (no snap-backs), the
         // body animates, and the mover keeps WoW's ground under the feet; X/Z land exactly below.
         if let Some(mc) = speed_capsule.10.follow.filter(|_| speed_capsule.10.xz_only) {
+            // Face where the WildStar character faces, and walk the gap in that frame: forward,
+            // back and strafe, as WildStar does (no sharp turns on a sidestep).
+            player.face_yaw = mc.yaw;
             let d = Vec3::new(mc.feet.x - player.pos.x, 0.0, mc.feet.z - player.pos.z);
             if d.length() > 0.15 && may_translate {
-                player.face_yaw = (-d.x).atan2(-d.z);
-                axes.fwd = 1;
-                axes.translating = true;
+                let rot = Quat::from_rotation_y(mc.yaw);
+                let ahead = (rot * Vec3::NEG_Z).dot(d);
+                let right = (rot * Vec3::X).dot(d);
+                let dead = 0.35 * d.length();
+                axes.fwd = if ahead > dead { 1 } else if ahead < -dead { -1 } else { 0 };
+                axes.side = if right > dead { 1 } else if right < -dead { -1 } else { 0 };
+                axes.translating = axes.fwd != 0 || axes.side != 0;
             }
         }
         let input::MoveAxes {

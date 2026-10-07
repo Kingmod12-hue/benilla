@@ -417,6 +417,8 @@ pub(crate) struct McPlayer {
     /// Walk-bob phase and amplitude, as Minecraft's `bobView` reads them.
     pub(crate) bob_phase: f32,
     pub(crate) bob_amount: f32,
+    /// The guest's yaw field as sent (the WildStar bridge: radians in WoW's own convention).
+    pub(crate) yaw: f32,
 }
 
 /// What the player controller reads: when `Some`, the avatar stands where Minecraft's player does.
@@ -824,6 +826,7 @@ fn host_frame(
             fov_deg: f32_at(0x40),
             bob_phase,
             bob_amount,
+            yaw: f32_at(0x20),
         });
     }
 }
