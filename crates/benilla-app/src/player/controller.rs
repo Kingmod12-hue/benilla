@@ -627,7 +627,13 @@ pub(super) fn control(
         // SkyCraft: Minecraft's physics moved the player; the avatar stands where it stands. The
         // flags, animation and movement stream below still come from the same keys.
         if let Some(mc) = speed_capsule.10.follow {
-            player.pos = mc.feet;
+            if speed_capsule.10.xz_only {
+                // WildStar walks its own map: its height means nothing here, WoW's ground stays.
+                player.pos.x = mc.feet.x;
+                player.pos.z = mc.feet.z;
+            } else {
+                player.pos = mc.feet;
+            }
         }
 
         // Traced here, the first point that knows both the latch and the mover's verdict.

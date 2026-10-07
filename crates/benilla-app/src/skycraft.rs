@@ -133,6 +133,13 @@ fn protocol_version() -> u32 {
         .unwrap_or(10)
 }
 
+/// `SKYCRAFT_GUEST=wildstar`: the guest is the WildStar bridge in NexusForever (position only:
+/// it reads no input, draws no overlay, and walks its own map, so only X/Z are followed).
+fn wildstar_guest() -> bool {
+    static WS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WS.get_or_init(|| std::env::var("SKYCRAFT_GUEST").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wildstar")))
+}
+
 pub(crate) fn enabled() -> bool {
     std::env::var("BENILLA_SKYCRAFT").is_ok_and(|v| v.trim() == "1")
 }
@@ -419,6 +426,9 @@ pub(crate) struct ExternalPilot {
     /// Hold mouselook (the camera's TurnOrAction channel) while Minecraft drives and the cursor
     /// is not wanted.
     pub(crate) mouselook: bool,
+    /// The guest's height doesn't match WoW's ground (WildStar walks its own map): follow its
+    /// horizontal position only and keep WoW's own ground under the feet.
+    pub(crate) xz_only: bool,
 }
 
 #[derive(Resource, Default)]
@@ -658,6 +668,7 @@ fn host_frame(
         host.teleport_seq = (tick_ms() % 100_000) as u32 + 2;
     }
     pilot.follow = None;
+    pilot.xz_only = wildstar_guest();
     host.driving = false;
     host.screen_open = false;
     let Some(link) = host.link else {
@@ -840,6 +851,12 @@ fn claim_input(
         pilot.mouselook = false;
         return;
     };
+    // The WildStar guest takes no input from here: it is played in its own window.
+    if wildstar_guest() {
+        keyboard.clear();
+        pilot.mouselook = false;
+        return;
+    }
     let typing = capture.typing;
     let screen = host.screen_open && host.driving;
     let mut down = std::mem::take(&mut host.keys_down);
