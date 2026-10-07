@@ -491,7 +491,7 @@ pub(super) fn control(
         // `GetCurrentSpeed` (`0x7c4c90`), shared with the remote extrapolator: the walk arm comes
         // before the backward min, so walking backwards is walk speed. It takes this frame's gait
         // intent, since the wire word is built after the mover.
-        let speed = crate::net::current_speed(
+        let mut speed = crate::net::current_speed(
             &speeds,
             if net_backward {
                 move_flags::BACKWARD
@@ -503,6 +503,12 @@ pub(super) fn control(
                 0
             },
         );
+        // WildStar guest: run fast enough to keep up with the WildStar character (it can outrun
+        // WoW's run speed), up to twice the normal speed while catching up.
+        if let Some(mc) = speed_capsule.10.follow.filter(|_| speed_capsule.10.xz_only) {
+            let gap = Vec2::new(mc.feet.x - player.pos.x, mc.feet.z - player.pos.z).length();
+            speed = speed.max((gap * 3.0).min(speed * 2.0));
+        }
         // `Jump` (`0x513bd0`) inlines `0x5144e0` and `0x514560`, which is `may_translate` term for
         // term: health, root and stand state 7. Hover's refusal is the movement handler's
         // (`0x7c623a`), which keeps the mounted flourish reachable while hovering.
@@ -639,9 +645,15 @@ pub(super) fn control(
         // flags, animation and movement stream below still come from the same keys.
         if let Some(mc) = speed_capsule.10.follow {
             if speed_capsule.10.xz_only {
-                // WildStar walks its own map: its height means nothing here, WoW's ground stays.
-                player.pos.x = mc.feet.x;
-                player.pos.z = mc.feet.z;
+                // WildStar walks its own map: WoW's mover walked us toward it over WoW's ground
+                // (above). Only a big gap (a WildStar teleport, a mount) is closed in one jump, from
+                // a little above so the body lands on the ground rather than inside a hill.
+                let gap = Vec2::new(mc.feet.x - player.pos.x, mc.feet.z - player.pos.z).length();
+                if gap > 25.0 {
+                    player.pos.x = mc.feet.x;
+                    player.pos.z = mc.feet.z;
+                    player.pos.y += 3.0;
+                }
             } else {
                 player.pos = mc.feet;
             }
