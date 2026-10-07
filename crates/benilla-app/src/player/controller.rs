@@ -363,7 +363,7 @@ pub(super) fn control(
         }
         // `0x514560`, after `apply_server_moves`, so this frame's root edge is already in `modes`.
         let may_translate = mover.may_translate(player.modes.rooted);
-        let axes = input::move_axes(
+        let mut axes = input::move_axes(
             binds,
             &buttons,
             &mut player,
@@ -372,6 +372,17 @@ pub(super) fn control(
             may_translate,
             may_turn,
         );
+        // WildStar guest: no keys reach this window, so walk the way the WildStar character went.
+        // Face that way and hold "forward": the server then hears a normal run (no snap-backs), the
+        // body animates, and the mover keeps WoW's ground under the feet; X/Z land exactly below.
+        if let Some(mc) = speed_capsule.10.follow.filter(|_| speed_capsule.10.xz_only) {
+            let d = Vec3::new(mc.feet.x - player.pos.x, 0.0, mc.feet.z - player.pos.z);
+            if d.length() > 0.15 && may_translate {
+                player.face_yaw = (-d.x).atan2(-d.z);
+                axes.fwd = 1;
+                axes.translating = true;
+            }
+        }
         let input::MoveAxes {
             fwd: fwd_axis,
             side: side_axis,
