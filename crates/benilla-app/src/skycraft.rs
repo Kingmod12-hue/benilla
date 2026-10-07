@@ -140,6 +140,18 @@ fn wildstar_guest() -> bool {
     *WS.get_or_init(|| std::env::var("SKYCRAFT_GUEST").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wildstar")))
 }
 
+/// WildStar damage to WoW damage (`SKYCRAFT_WS_DAMAGE`, 0.25 by default).
+fn ws_damage_scale() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("SKYCRAFT_WS_DAMAGE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(0.25)
+    })
+}
+
 pub(crate) fn enabled() -> bool {
     std::env::var("BENILLA_SKYCRAFT").is_ok_and(|v| v.trim() == "1")
 }
@@ -1131,7 +1143,13 @@ fn combat(
                 }
                 // Minecraft's damage (a diamond sword hits for 7) against WoW's health, which
                 // grows with level: a few hits for a mob of your own level, as in Minecraft.
-                let damage = (mc_damage * (2.0 + level as f32)).round().max(1.0) as u32;
+                let damage = if wildstar_guest() {
+                    // WildStar's own damage number, scaled to WoW's health pools
+                    // (`SKYCRAFT_WS_DAMAGE`, 0.25 by default).
+                    (mc_damage * ws_damage_scale()).round().max(1.0) as u32
+                } else {
+                    (mc_damage * (2.0 + level as f32)).round().max(1.0) as u32
+                };
                 if selection.guid != Some(guid) {
                     selection.last = selection.guid;
                     selection.target = Some(entity);
