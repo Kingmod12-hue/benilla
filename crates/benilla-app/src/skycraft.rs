@@ -484,6 +484,9 @@ struct SkyHost {
     actors: HashMap<u32, (Entity, u64, u32, u32)>,
     /// Our own health last frame, for mirroring WoW's hits onto Minecraft's hearts.
     last_health: Option<u32>,
+    /// WildStar guest: its character was dead last frame; when we last topped our health up.
+    ws_dead: bool,
+    last_topup: f32,
     /// Minecraft's arrows and dropped items as drawn here: MC entity id to ours.
     shown: HashMap<u32, Entity>,
     things: Option<ThingAssets>,
@@ -1032,10 +1035,41 @@ fn combat(
     net: Res<crate::net::NetCommands>,
     mut selection: ResMut<crate::target::Selection>,
     player: Res<Player>,
+    time: Res<Time>,
 ) {
     let Some(link) = host.link else {
         return;
     };
+    // A GM command on our own character: the selection cleared first (the server applies
+    // `.modify`, `.die` and `.revive` to the selection, or to us with none).
+    let self_command = |selection: &mut crate::target::Selection, text: String| {
+        if selection.guid.is_some() {
+            selection.last = selection.guid;
+            selection.target = None;
+            selection.guid = None;
+        }
+        let _ = net.0.send(crate::net::ClientCommand::SetSelection { guid: 0 });
+        let _ = net.0.send(crate::net::ClientCommand::Chat {
+            kind: crate::net::ChatKind::Say,
+            target: None,
+            text,
+            language: None,
+        });
+    };
+    // WildStar decides life and death: its character dies, ours dies; it revives, ours revives
+    // where it stands, and the positions link up again from there.
+    if wildstar_guest() && host.link.is_some() && host.mc_pid != 0 {
+        let dead = host.last_flags & MC_DEAD != 0;
+        if dead && !host.ws_dead {
+            info!("skycraft: the WildStar character died; so does ours");
+            self_command(&mut selection, ".die".into());
+        } else if !dead && host.ws_dead {
+            info!("skycraft: the WildStar character is back; reviving ours");
+            self_command(&mut selection, ".revive".into());
+            host.teleport_pending = true;
+        }
+        host.ws_dead = dead;
+    }
     if !host.driving {
         while link.pop_event().is_some() {}
         if !host.actors.is_empty() {
@@ -1170,7 +1204,25 @@ fn combat(
     }
 
     // ---- WoW's hits on us ----
-    if let Some(store) = self_store {
+    if let (Some(store), true) = (self_store, wildstar_guest()) {
+        // WildStar's health is the only health: a WoW hit goes to it as a share of our maximum
+        // (kInHurt, a = share x 1e6, b = attacker), and ours is topped back up.
+        let hp = store.0.unit_health().unwrap_or(0);
+        let max = store.0.unit_max_health().unwrap_or(0);
+        if let Some(last) = host.last_health {
+            if hp < last && last > 0 && max > 0 {
+                let share = (last - hp) as f32 / max as f32;
+                link.push_input(IN_HURT, 0, (share * 1e6) as i32, attacker as i32, 0);
+                info!("skycraft: WoW hit us for {} ({:.1}% of max) -> WildStar", last - hp, share * 100.0);
+            }
+        }
+        let now = time.elapsed_secs();
+        if hp > 0 && max > 0 && hp < max && now - host.last_topup > 1.0 {
+            host.last_topup = now;
+            self_command(&mut selection, format!(".modify hp {max}"));
+        }
+        host.last_health = Some(hp);
+    } else if let Some(store) = self_store {
         let hp = store.0.unit_health().unwrap_or(0);
         let max = store.0.unit_max_health().unwrap_or(0);
         if let Some(last) = host.last_health {
