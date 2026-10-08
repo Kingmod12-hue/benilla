@@ -88,6 +88,8 @@ const ACTOR_DEAD: u32 = 1 << 1;
 const ACTOR_IN_COMBAT: u32 = 1 << 3;
 const EV_HIT_ACTOR: u32 = 1;
 const EV_PLAYER_DIED: u32 = 2;
+/// The WildStar bridge's own event: the player cast a spell (flags field = WildStar base spell id).
+const EV_WS_CAST: u32 = 6;
 const IN_HURT: u16 = 7;
 /// Stand-ins exist this far out (blocks), as SkyCraft's.
 const ACTOR_RANGE_BLOCKS: f32 = 80.0;
@@ -138,6 +140,29 @@ fn protocol_version() -> u32 {
 fn wildstar_guest() -> bool {
     static WS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WS.get_or_init(|| std::env::var("SKYCRAFT_GUEST").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wildstar")))
+}
+
+/// The WoW spell whose effect stands in for a WildStar spell: `benilla-config/wildstar-spells.txt`
+/// (`<wildstar base spell id> = <wow spell id>` per line), else Fireball (133) for an attack and
+/// Flash Heal (2061) for a cast on ourselves or an ally.
+fn ws_spell_visual(ws_spell: u32, on_enemy: bool) -> u32 {
+    static MAP: std::sync::OnceLock<HashMap<u32, u32>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let path = std::env::var("BENILLA_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("wildstar-spells.txt");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let l = l.split('#').next()?.trim();
+                let (a, b) = l.split_once('=')?;
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+            .collect()
+    });
+    map.get(&ws_spell).copied().unwrap_or(if on_enemy { 133 } else { 2061 })
 }
 
 /// WildStar damage to WoW damage (`SKYCRAFT_WS_DAMAGE`, 0.25 by default).
@@ -1029,13 +1054,18 @@ fn combat(
         ),
         Without<crate::net::SelfPlayer>,
     >,
-    me: Query<(&crate::net::ObjectStore, &crate::net::Guid), With<crate::net::SelfPlayer>>,
+    me: Query<(Entity, &crate::net::ObjectStore, &crate::net::Guid), With<crate::net::SelfPlayer>>,
     reactions: crate::target::ReactionInputs,
     names: Res<crate::names::NameCache>,
     net: Res<crate::net::NetCommands>,
     mut selection: ResMut<crate::target::Selection>,
     player: Res<Player>,
     time: Res<Time>,
+    mut visuals: (
+        MessageWriter<crate::creature_anim::CastEvent>,
+        MessageWriter<crate::creature_anim::SpellGoTargets>,
+        ResMut<crate::creature_anim::PlaySeq>,
+    ),
 ) {
     let Some(link) = host.link else {
         return;
@@ -1080,8 +1110,9 @@ fn combat(
         return;
     }
     let me = me.single().ok();
-    let self_store = me.map(|(s, _)| s);
-    let self_guid = me.map(|(_, g)| g.0);
+    let self_entity = me.map(|(e, _, _)| e);
+    let self_store = me.map(|(_, s, _)| s);
+    let self_guid = me.map(|(_, _, g)| g.0);
     let factions = reactions.factions.as_deref();
     let ypb = yards_per_block();
 
@@ -1199,6 +1230,32 @@ fn combat(
                 info!("skycraft: Minecraft hit {guid:#x} for {mc_damage:.1} -> .damage {damage}");
             }
             EV_PLAYER_DIED => info!("skycraft: the Minecraft player died"),
+            // WildStar bridge: the player cast a WildStar spell; play a matching WoW effect
+            // from us (onto the WoW mob it hit, if any).
+            EV_WS_CAST => {
+                let ws_spell = u32_at(&ev, 24);
+                let target = host.actors.get(&form).map(|a| a.0);
+                let wow_spell = ws_spell_visual(ws_spell, target.is_some());
+                if let Some(me) = self_entity {
+                    let (casts, gos, seq) = &mut visuals;
+                    casts.write(crate::creature_anim::CastEvent {
+                        entity: me,
+                        spell_id: wow_spell,
+                        kind: crate::creature_anim::CastEventKind::Go,
+                        seq: seq.next(),
+                    });
+                    gos.write(crate::creature_anim::SpellGoTargets {
+                        caster: me,
+                        spell_id: wow_spell,
+                        hits: target.into_iter().collect(),
+                        misses: Vec::new(),
+                        dest: None,
+                        ammo_display_id: None,
+                        seq: seq.next(),
+                    });
+                }
+                info!("skycraft: WildStar spell {ws_spell} -> WoW effect {wow_spell}");
+            }
             _ => {}
         }
     }
